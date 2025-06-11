@@ -1,56 +1,51 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useForm, FormProvider } from "react-hook-form";
+import { InputWithIcon } from "@/components/ui/input";
+import {log} from "util";
+
+interface ChosenRepo {
+    name: string;
+    html_url: string;
+}
+
+interface FormData {
+    message: string;
+    chosenRepos: ChosenRepo[];
+}
 
 export default function RepoList() {
-    const [repos, setRepos] = useState<any[]>([]);
-    const [loading, setLoading] = useState(true);
-    useEffect(() => {
-        async function fetchRepos() {
-            const res = await fetch("/api/repos", {
-                credentials: "include",
-            });
-            const data = await res.json();
-            setRepos(data);
-            setLoading(false);
-        }
-        fetchRepos();
-    }, []);
+    const methods = useForm<FormData>({
+        defaultValues: {
+            message: "",
+            chosenRepos: [],
+        },
+    });
 
-    if (loading) return <p>Loading repos...</p>;
-
-    const analyzeHandler = async (repo: string)=>{
-        const res = await fetch("http://localhost:8000/analyze",
-            {
-                method: "POST",
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({repoUrl: repo})
-            }
-        )
-        const data = await res.json();
-        console.log("Analysis result:", data);
-    }
+    const onSubmit = (data: FormData) => {
+        console.log("Form data submitted:", data);
+    };
 
     return (
-        <div>
-            <h2 className="text-lg font-semibold mb-2 ">Your GitHub Repositories</h2>
-            <ul className="list-disc pl-6">
-                    {repos.map((repo) => (
-                        <li key={repo.id}>
-                            <a href={repo.html_url} className="text-blue-500" target="_blank" rel="noreferrer">
-                                {repo.name}
-                            </a>
-                            <button
-                                onClick={()=>analyzeHandler(repo.html_url)}
-                            >
-                                Analyze
-                            </button>
-                        </li>
-                    ))}
-            </ul>
+        <div className="max-container-l pt-[184px] relative">
+            {/* Header Section */}
+            <div className="max-w-[540px] mx-auto text-center">
+                <h2 className="text-4xl">
+                    Lorem ipsum lacus volutpat ultricies mattis tellus amet pellentesque
+                </h2>
+                <p className="text-base mt-10">
+                    Ante consequat ultrices sit rhoncus tellus auctor in neque phasellus arcu.
+                </p>
+            </div>
+
+            {/* Form Section */}
+            <div className="max-w-[624px] mx-auto mt-[100px]">
+                <FormProvider {...methods}>
+                    <form onSubmit={methods.handleSubmit(onSubmit)}>
+                        <InputWithIcon name="message"  />
+                    </form>
+                </FormProvider>
+            </div>
         </div>
     );
 }

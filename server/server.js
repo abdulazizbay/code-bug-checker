@@ -1,15 +1,22 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-
-
+const JSON5 = require('json5');
 require('dotenv').config();
-
 const app = express();
 app.use(cors());
 const port = 8000;
-
 app.use(express.json());
+const mysql = require('mysql2/promise');
+
+
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+});
+
 
 const GEMINI_API_URL =
     'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
@@ -20,6 +27,7 @@ let savedSuggestions = {};
 
 async function fetchRepoFiles(owner, repo, path = '') {
     try {
+        console.log(GITHUB_TOKEN)
         const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
         const response = await axios.get(url, {
             headers: { Authorization: `token ${GITHUB_TOKEN}` },
@@ -48,21 +56,90 @@ async function fetchRepoFiles(owner, repo, path = '') {
 
 async function analyzeWithAI(fileContent) {
     try {
+        console.log(222222)
         const response = await axios.post(
             `${GEMINI_API_URL}?key=${GEMINI_API_KEY}`,
             {
-                contents: [{ parts: [{ text: `if there is precise bugs, provide some. provide it like this: improved code and at the end of code provide bug explanation. if there is no bug, just return code itself not changing anything, by commenting that it is ok:\n${fileContent}` }] }],
+                contents: [{
+                    parts: [{
+                        text: `
+You are a strict JSON-generating code reviewer. Respond ONLY with valid, parsable JSON. No explanations, no markdown, no comments.
+
+Your job:
+- If the message asks to "change" or "modify" a specific file, only return that file with the updated code as "fixed_code" and any related "issues".
+- Do NOT return any other files in the JSON at all.
+- If the message is to "analyze", return all files with their issues.
+  - If a file has issues, include "fixed_code" with suggested fixes.
+  - If a file has no issues, omit "fixed_code" entirely for that file.
+
+Output Format:
+{
+  "filename": {
+    "issues": [
+      {
+        "issue": "IssueType",
+        "explanation": "Why it’s an issue",
+        "line_start": <int>,
+        "line_end": <int>
+      }
+    ],
+    // Include "fixed_code" only if the file has fixes
+    "fixed_code": "escaped code string here"
+  }
+}
+
+Guidelines:
+- "fixed_code" must be a valid escaped JSON string (use \\n, \\", etc. correctly).
+- Only return the files that are explicitly being modified (for change/modify requests).
+- Ensure output is pure JSON with no markdown, no comments, and no backticks.
+- Always produce well-formed JSON with no trailing commas.
+
+Input:
+${fileContent}
+`.trim()
+
+
+                    }]
+                }]
             },
             {
                 headers: { 'Content-Type': 'application/json' },
             }
         );
+        console.log(1111)
+        let rawText = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        console.log(rawText)
 
-        return response.data.candidates?.[0]?.content?.parts?.[0]?.text || fileContent;
+        rawText = rawText.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+
+// Extract the JSON block
+        const jsonMatch = rawText.match(/{[\s\S]*}/);
+        if (!jsonMatch) throw new Error('No JSON object found in Gemini response');
+
+        let jsonText = jsonMatch[0];
+
+// 🧹 Post-process fixed_code for escaping issues
+        jsonText = sanitizeFixedCodeStrings(jsonText);
+
+        const parsed = JSON5.parse(jsonText);
+        return parsed;
+
+
     } catch (error) {
-        console.error('Error analyzing with AI:', error.response?.data || error.message);
-        return fileContent;
+        console.error('❌ Gemini output error or invalid JSON5:', error.message);
+        return null;
     }
+}
+
+function sanitizeFixedCodeStrings(jsonText) {
+    return jsonText.replace(
+        /"fixed_code"\s*:\s*"((?:[^"\\]|\\.)*)"/g,
+        (_, code) => {
+            const safeCode = JSON.stringify(code.replace(/\\n/g, '\n').replace(/\\"/g, '"'))
+                .slice(1, -1);
+            return `"fixed_code": "${safeCode}"`;
+        }
+    );
 }
 
 async function rewriteFullCode(fileContent) {
@@ -109,49 +186,93 @@ async function updateFileOnGitHub(owner, repo, filePath, newContent, sha, newBra
     }
 }
 
+async function getFileSha(owner, repo, filePath, branch) {
+    try {
+        const { data } = await axios.get(
+            `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=${branch}`,
+            { headers: { Authorization: `token ${GITHUB_TOKEN}` } }
+        );
+        return data.sha;
+    } catch (error) {
+        console.error(`❌ Failed to get SHA for ${filePath}:`, error.response?.data || error.message);
+        return null;
+    }
+}
 app.post('/analyze', async (req, res) => {
-    const { repoUrl } = req.body;
-    if (!repoUrl) {
-        return res.status(400).json({ error: 'Repository URL is required' });
+    const { message, chosenRepos } = req.body;
+
+    if (!message || !chosenRepos || !Array.isArray(chosenRepos)) {
+        return res.status(400).json({ error: 'Message and chosenRepos array are required' });
     }
 
+    let allSuggestedFixes = {};
+    let allCleanedFixes = {};
+
     try {
-        const repoParts = repoUrl.split('/');
-        const owner = repoParts[3];
-        const repo = repoParts[4];
+        for (const repo of chosenRepos) {
+            const repoUrl = repo.html_url;
+            if (!repoUrl) continue;
 
-        const fileContents = await fetchRepoFiles(owner, repo);
-        if (fileContents.length === 0) {
-            return res.status(404).json({ error: 'No .js or .java files found in the repository.' });
+            const [owner, repoName] = repoUrl.replace('https://github.com/', '').split('/');
+            const fileContents = await fetchRepoFiles(owner, repoName);
+
+            if (fileContents.length === 0) continue;
+
+            let suggestedFixes = {};
+            let cleanedFixes = {};
+
+            for (const file of fileContents) {
+                const filePrompt = `file: ${file.path}\n${file.content}`;
+                const aiSuggestion = await analyzeWithAI(`${message}\n\n${filePrompt}`);
+
+                if (!aiSuggestion || !aiSuggestion[file.path]) continue;
+
+                aiSuggestion[file.path].original_code = file.content;
+                suggestedFixes[file.path] = aiSuggestion[file.path];
+                const [result] = await pool.query(
+                    'INSERT INTO prompt_history (userId, prompt, aiResponse) VALUES (?, ?, ?)',
+                    [owner, message, JSON.stringify(aiSuggestion)]
+                );
+                console.log(`✅ Inserted row with ID: ${result.insertId}`);
+
+                if (aiSuggestion[file.path].fixed_code) {
+                    cleanedFixes[file.path] = await rewriteFullCode(aiSuggestion[file.path].fixed_code);
+                }
+            }
+
+            savedSuggestions[repoName] = { owner, fileContents, suggestedFixes, cleanedFixes };
+
+            allSuggestedFixes[repoName] = suggestedFixes;
+            allCleanedFixes[repoName] = cleanedFixes;
         }
 
-        let suggestedFixes = {};
-        let cleanedFixes = {};
-
-        for (const file of fileContents) {
-            const aiSuggestion = await analyzeWithAI(file.content);
-            suggestedFixes[file.path] = aiSuggestion;
-
-            cleanedFixes[file.path] = await rewriteFullCode(aiSuggestion);
-        }
-
-        savedSuggestions[repo] = { owner, fileContents, suggestedFixes, cleanedFixes };
-
-        res.json({ message: 'Analysis completed. You can now commit changes using /committogit.', suggestedFixes });
+        res.status(200).json({
+            message: 'Analysis completed for all selected repositories.',
+            suggestedFixes: allSuggestedFixes,
+            cleanedFixes: allCleanedFixes,
+        });
     } catch (error) {
-        console.error('Error analyzing code:', error.response?.data || error.message);
-        res.status(500).json({ error: 'Error analyzing the repository.' });
+        console.error('Error analyzing repositories:', error.response?.data || error.message);
+        res.status(500).json({ error: 'Error analyzing the repositories.' });
     }
 });
 
 app.post('/committogit', async (req, res) => {
-    const { repoName } = req.body;
-    if (!repoName || !savedSuggestions[repoName]) {
-        return res.status(400).json({ error: 'No analysis found for this repository. Run /analyze first.' });
-    }
+    const { suggestedFixes } = req.body;
+    const repoName = Object.keys(suggestedFixes || {})[0];
 
-    const { owner, fileContents, cleanedFixes } = savedSuggestions[repoName];
+    if (!repoName) return res.status(400).json({ error: 'No repo name found' });
+    if (!savedSuggestions[repoName]) return res.status(400).json({ error: 'No saved suggestions for repo' });
+
+    const { owner } = savedSuggestions[repoName];
     const newBranch = `aifix-${Date.now()}`;
+
+    // Extract files correctly:
+    const filesObj = suggestedFixes[repoName];
+    const fileContents = Object.entries(filesObj).map(([path, data]) => ({
+        path,
+        content: data.fixed_code,
+    }));
 
     try {
         const { data: mainBranch } = await axios.get(
@@ -161,28 +282,48 @@ app.post('/committogit', async (req, res) => {
 
         await axios.post(
             `https://api.github.com/repos/${owner}/${repoName}/git/refs`,
-            {
-                ref: `refs/heads/${newBranch}`,
-                sha: mainBranch.object.sha,
-            },
+            { ref: `refs/heads/${newBranch}`, sha: mainBranch.object.sha },
             { headers: { Authorization: `token ${GITHUB_TOKEN}` } }
         );
 
         for (const file of fileContents) {
-            const rewrittenContent = cleanedFixes[file.path];
             console.log(`🔹 Updating ${file.path}...`);
-            console.log('New Content:\n', rewrittenContent);
 
-            await updateFileOnGitHub(owner, repoName, file.path, rewrittenContent, file.sha, newBranch);
+            const sha = await getFileSha(owner, repoName, file.path, newBranch);
+            if (!sha) {
+                console.error(`⚠️ Skipping ${file.path} due to missing SHA.`);
+                continue;
+            }
+
+            await updateFileOnGitHub(owner, repoName, file.path, file.content, sha, newBranch);
         }
 
-        res.json({ message: 'Changes committed to GitHub.', branch: newBranch });
+
+        res.json({ message: 'Changes committed', branch: newBranch });
     } catch (error) {
-        console.error('Error committing to GitHub:', error.response?.data || error.message);
+        console.error("❌ Git commit error:", error.response?.data || error.message);
         res.status(500).json({ error: 'Error committing changes to GitHub.' });
     }
 });
 
+
+
+app.get('/prompt-history', async (req, res) => {
+    const { userId } = req.query;
+    if (!userId) {
+        return res.status(400).json({ error: 'Missing userId query parameter' });
+    }
+
+    try {
+
+        const [rows] = await pool.query('SELECT id, prompt, aiResponse, createdAt FROM prompt_history WHERE userId = ?', [userId]);
+        console.log(rows)
+        res.json({ userId, history: rows });
+    } catch (error) {
+        console.error('DB error:', error);
+        res.status(500).json({ error: 'Database query failed' });
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server running at http://localhost:${port}`);
